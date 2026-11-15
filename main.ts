@@ -1038,7 +1038,10 @@ function refused(res: ServerResponse, wire: 'openai' | 'anthropic', result: Unse
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
+  const routingStartedAt = Date.now();
+  const routingPromptId = brief.prompts[manifestIndex]?.id ?? null;
   const result = await serve(body, body.stream === true);
+  logRouting(routingPromptId, result, Date.now() - routingStartedAt);
   if (!result.ok) return refused(res, 'openai', result);
   const headers = trailHeaders(result.trail);
   if (body.stream === true) {
@@ -1059,7 +1062,10 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const upstreamBody = anthropicToOpenAI(body, '');
+  const routingStartedAt = Date.now();
+  const routingPromptId = brief.prompts[manifestIndex]?.id ?? null;
   const result = await serve(upstreamBody, body.stream === true);
+  logRouting(routingPromptId, result, Date.now() - routingStartedAt);
   if (!result.ok) return refused(res, 'anthropic', result);
   const headers = trailHeaders(result.trail);
   if (body.stream === true) {
@@ -1090,6 +1096,111 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
   sendError(res, url.pathname === '/v1/messages' ? 'anthropic' : 'openai', 404, 'not_found', `no route ${req.method ?? ''} ${url.pathname}`);
+}
+
+// ---------------------------------------------------------------------------
+// Catalog self-check and per-request routing log.
+//
+// Two observability additions that never touch routing, model selection, any
+// response, or the catalog. The self-check compares the catalog this entry
+// registered with the gateway's live model list once at startup and warns
+// about drift; the routing log writes one JSON line per served prompt to
+// stderr. Both are fail-open: any error is logged once and serving carries on
+// as if they were not there. The only wall-clock read in this file lives in
+// the routing log's latency field, and it reaches stderr alone — never a
+// request, a response, or the state the replay compares.
+// ---------------------------------------------------------------------------
+
+/** The gateway's model-list route: the OpenAI-compatible root plus /models. */
+function gatewayModelsUrl(): string {
+  if (GATEWAY_URL === '') return '';
+  return GATEWAY_URL.endsWith('/v1') ? `${GATEWAY_URL}/models` : `${GATEWAY_URL}/v1/models`;
+}
+
+/** The live model ids the gateway lists, in the order it lists them. */
+async function liveModelIds(): Promise<string[]> {
+  const url = gatewayModelsUrl();
+  if (url === '') throw new Error('OPENAI_BASE_URL is not set');
+  const res = await fetch(url, {
+    headers: { authorization: `Bearer ${GATEWAY_KEY}` },
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!res.ok) throw new Error(`GET ${url} answered HTTP ${res.status}`);
+  const body: unknown = await res.json();
+  if (!isRecord(body) || !Array.isArray(body.data)) throw new Error(`GET ${url} answered without a model list`);
+  const ids: string[] = [];
+  for (const row of body.data) {
+    if (isRecord(row) && typeof row.id === 'string' && row.id !== '') ids.push(row.id);
+  }
+  return ids;
+}
+
+/** The ids the catalog registers, across its providers, in catalog order. */
+function catalogModelIds(report: CatalogReport): string[] {
+  const ids: string[] = [];
+  for (const provider of report.providers) {
+    for (const model of provider.models) ids.push(model.id);
+  }
+  return ids;
+}
+
+/**
+ * Compare the registered catalog with the gateway's live list and warn about
+ * drift: a catalog model the gateway no longer lists (retired) and a live
+ * model the catalog does not name. Fail-open by construction — a fetch or
+ * parse failure logs once and returns — so this never throws and never blocks
+ * serving; it makes exactly one GET /v1/models listing, which the trial does
+ * not count toward its model-call budget.
+ */
+async function catalogSelfCheck(report: CatalogReport): Promise<void> {
+  let live: string[];
+  try {
+    live = await liveModelIds();
+  } catch (err) {
+    log(`catalog self-check skipped: ${(err as Error).message}`);
+    return;
+  }
+  const liveSet = new Set(live);
+  const registered = catalogModelIds(report);
+  for (const id of registered) {
+    if (!liveSet.has(id)) log(`catalog self-check: ${id} is registered but the gateway no longer lists it`);
+  }
+  const registeredSet = new Set(registered);
+  for (const id of live) {
+    if (!registeredSet.has(id)) log(`catalog self-check: ${id} is live on the gateway but missing from the catalog`);
+  }
+}
+
+/** One routing record: what a single served prompt tried, used, and cost in time. */
+interface RoutingRecord {
+  prompt: string | null;
+  candidates: string[];
+  servedBy: string | null;
+  failovers: number;
+  latencyMs: number;
+}
+
+/**
+ * One JSON line to stderr for a prompt `serve` answered: the prompt's id, the
+ * models tried in order, the model that served it (null when none did), how
+ * many attempts failed before it, and the wall time serve took. Logging only:
+ * nothing here reaches a response body, a header, a status, or a routing
+ * decision.
+ */
+function logRouting(promptId: string | null, result: Served | Unserved, latencyMs: number): void {
+  const candidates: string[] = [];
+  for (const row of result.trail) {
+    if (!candidates.includes(row.model)) candidates.push(row.model);
+  }
+  if (result.ok && !candidates.includes(result.model)) candidates.push(result.model);
+  const record: RoutingRecord = {
+    prompt: promptId,
+    candidates,
+    servedBy: result.ok ? result.model : null,
+    failovers: result.trail.length,
+    latencyMs,
+  };
+  process.stderr.write(`${JSON.stringify(record)}\n`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1166,6 +1277,7 @@ async function start(): Promise<void> {
   if (port === 8080) throw new Error('the OS picked 8080, which the env owns on one layout: restart the trial');
   log(`listening on 0.0.0.0:${port} with ${servedModels().length} free models`);
   await register(port, catalog);
+  void catalogSelfCheck(catalog);
   process.on('SIGTERM', () => process.exit(0));
   process.on('SIGINT', () => process.exit(0));
   poll(server);
