@@ -1,5 +1,11 @@
 # free-model-aggregator-02
 
+[![make.fun · free-model-aggregator-02](https://make.fun/badge/free-model-aggregator-02.svg)](https://make.fun/bounty/free-model-aggregator-02?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-02)
+[![rank](https://make.fun/badge/free-model-aggregator-02/asenamapr/free-model-aggregator-02/rank.svg)](https://make.fun/bounty/free-model-aggregator-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-02)
+[![reward](https://make.fun/badge/free-model-aggregator-02/asenamapr/free-model-aggregator-02/reward.svg)](https://make.fun/bounty/free-model-aggregator-02?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-02)
+
+Built for the [make.fun bounty "The best live free-model aggregator"](https://make.fun/bounty/free-model-aggregator-02) ($500 in USDC).
+
 One server that serves an OpenAI-compatible API (`POST /v1/chat/completions`,
 `GET /v1/models` with Bearer auth) and an Anthropic-compatible API
 (`POST /v1/messages`, `GET /v1/models` with `x-api-key` auth), in JSON and in
